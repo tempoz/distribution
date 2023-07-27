@@ -15,11 +15,12 @@ import (
 
 	"gopkg.in/check.v1"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/distribution/distribution/v3/context"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/distribution/distribution/v3/registry/storage/driver/testsuites"
 )
 
@@ -27,7 +28,7 @@ import (
 func Test(t *testing.T) { check.TestingT(t) }
 
 var (
-	s3DriverConstructor func(rootDirectory, storageClass string) (*Driver, error)
+	s3DriverConstructor func(rootDirectory string, storageClass s3types.StorageClass) (*Driver, error)
 	skipS3              func() string
 )
 
@@ -42,7 +43,7 @@ func init() {
 		skipVerify       = os.Getenv("S3_SKIP_VERIFY")
 		v4Auth           = os.Getenv("S3_V4_AUTH")
 		region           = os.Getenv("AWS_REGION")
-		objectACL        = os.Getenv("S3_OBJECT_ACL")
+		objectACL        = s3types.ObjectCannedACL(os.Getenv("S3_OBJECT_ACL"))
 		regionEndpoint   = os.Getenv("REGION_ENDPOINT")
 		forcePathStyle   = os.Getenv("AWS_S3_FORCE_PATH_STYLE")
 		sessionToken     = os.Getenv("AWS_SESSION_TOKEN")
@@ -57,7 +58,7 @@ func init() {
 	}
 	defer os.Remove(root)
 
-	s3DriverConstructor = func(rootDirectory, storageClass string) (*Driver, error) {
+	s3DriverConstructor = func(rootDirectory string, storageClass s3types.StorageClass) (*Driver, error) {
 		encryptBool := false
 		if encrypt != "" {
 			encryptBool, err = strconv.ParseBool(encrypt)
@@ -97,9 +98,16 @@ func init() {
 			}
 		}
 
-		useDualStackBool := false
+		useDualStackState := aws.DualStackEndpointStateUnset
 		if useDualStack != "" {
-			useDualStackBool, err = strconv.ParseBool(useDualStack)
+			useDualStackBool, err := strconv.ParseBool(useDualStack)
+			if err != nil {
+				if useDualStackBool {
+					useDualStackState = aws.DualStackEndpointStateEnabled
+				} else {
+					useDualStackState = aws.DualStackEndpointStateDisabled
+				}
+			}
 		}
 
 		multipartCombineSmallPart := true
@@ -140,7 +148,7 @@ func init() {
 			driverName + "-test",
 			objectACL,
 			sessionToken,
-			useDualStackBool,
+			useDualStackState,
 			accelerateBool,
 		}
 
@@ -156,7 +164,7 @@ func init() {
 	}
 
 	testsuites.RegisterSuite(func() (storagedriver.StorageDriver, error) {
-		return s3DriverConstructor(root, s3.StorageClassStandard)
+		return s3DriverConstructor(root, s3types.StorageClassStandard)
 	}, skipS3)
 }
 
@@ -166,17 +174,17 @@ func TestEmptyRootList(t *testing.T) {
 	}
 
 	validRoot := t.TempDir()
-	rootedDriver, err := s3DriverConstructor(validRoot, s3.StorageClassStandard)
+	rootedDriver, err := s3DriverConstructor(validRoot, s3types.StorageClassStandard)
 	if err != nil {
 		t.Fatalf("unexpected error creating rooted driver: %v", err)
 	}
 
-	emptyRootDriver, err := s3DriverConstructor("", s3.StorageClassStandard)
+	emptyRootDriver, err := s3DriverConstructor("", s3types.StorageClassStandard)
 	if err != nil {
 		t.Fatalf("unexpected error creating empty root driver: %v", err)
 	}
 
-	slashRootDriver, err := s3DriverConstructor("/", s3.StorageClassStandard)
+	slashRootDriver, err := s3DriverConstructor("/", s3types.StorageClassStandard)
 	if err != nil {
 		t.Fatalf("unexpected error creating slash root driver: %v", err)
 	}
@@ -212,14 +220,14 @@ func TestWalkEmptySubDirectory(t *testing.T) {
 		t.Skip(skipS3())
 	}
 
-	drv, err := s3DriverConstructor("", s3.StorageClassStandard)
+	drv, err := s3DriverConstructor("", s3types.StorageClassStandard)
 	if err != nil {
 		t.Fatalf("unexpected error creating rooted driver: %v", err)
 	}
 
 	// create an empty sub directory.
 	s3driver := drv.StorageDriver.(*driver)
-	if _, err := s3driver.S3.PutObject(&s3.PutObjectInput{
+	if _, err := s3driver.S3.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String(os.Getenv("S3_BUCKET")),
 		Key:    aws.String("/testdir/emptydir/"),
 	}); err != nil {
@@ -247,7 +255,7 @@ func TestStorageClass(t *testing.T) {
 	contents := []byte("contents")
 	ctx := context.Background()
 	for _, storageClass := range s3StorageClasses {
-		filename := "/test-" + storageClass
+		filename := "/test-" + string(storageClass)
 		s3Driver, err := s3DriverConstructor(rootDir, storageClass)
 		if err != nil {
 			t.Fatalf("unexpected error creating driver with storage class %v: %v", storageClass, err)
@@ -260,7 +268,7 @@ func TestStorageClass(t *testing.T) {
 		defer s3Driver.Delete(ctx, filename)
 
 		driverUnwrapped := s3Driver.Base.StorageDriver.(*driver)
-		resp, err := driverUnwrapped.S3.GetObject(&s3.GetObjectInput{
+		resp, err := driverUnwrapped.S3.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(driverUnwrapped.Bucket),
 			Key:    aws.String(driverUnwrapped.s3Path(filename)),
 		})
@@ -269,23 +277,23 @@ func TestStorageClass(t *testing.T) {
 		}
 		defer resp.Body.Close()
 		// Amazon only populates this header value for non-standard storage classes
-		if storageClass == s3.StorageClassStandard && resp.StorageClass != nil {
+		if storageClass == s3types.StorageClassStandard && resp.StorageClass != "" {
 			t.Fatalf(
 				"unexpected response storage class for file with storage class %v: %v",
 				storageClass,
-				*resp.StorageClass,
+				resp.StorageClass,
 			)
-		} else if storageClass != s3.StorageClassStandard && resp.StorageClass == nil {
+		} else if storageClass != s3types.StorageClassStandard && resp.StorageClass == "" {
 			t.Fatalf(
 				"unexpected response storage class for file with storage class %v: %v",
 				storageClass,
-				s3.StorageClassStandard,
+				s3types.StorageClassStandard,
 			)
-		} else if storageClass != s3.StorageClassStandard && storageClass != *resp.StorageClass {
+		} else if storageClass != s3types.StorageClassStandard && storageClass != resp.StorageClass {
 			t.Fatalf(
 				"unexpected response storage class for file with storage class %v: %v",
 				storageClass,
-				*resp.StorageClass,
+				resp.StorageClass,
 			)
 		}
 	}
@@ -298,7 +306,7 @@ func TestDelete(t *testing.T) {
 
 	rootDir := t.TempDir()
 
-	drvr, err := s3DriverConstructor(rootDir, s3.StorageClassStandard)
+	drvr, err := s3DriverConstructor(rootDir, s3types.StorageClassStandard)
 	if err != nil {
 		t.Fatalf("unexpected error creating driver with standard storage: %v", err)
 	}
@@ -517,7 +525,7 @@ func TestWalk(t *testing.T) {
 
 	rootDir := t.TempDir()
 
-	drvr, err := s3DriverConstructor(rootDir, s3.StorageClassStandard)
+	drvr, err := s3DriverConstructor(rootDir, s3types.StorageClassStandard)
 	if err != nil {
 		t.Fatalf("unexpected error creating driver with standard storage: %v", err)
 	}
@@ -671,7 +679,7 @@ func TestOverThousandBlobs(t *testing.T) {
 	}
 
 	rootDir := t.TempDir()
-	standardDriver, err := s3DriverConstructor(rootDir, s3.StorageClassStandard)
+	standardDriver, err := s3DriverConstructor(rootDir, s3types.StorageClassStandard)
 	if err != nil {
 		t.Fatalf("unexpected error creating driver with standard storage: %v", err)
 	}
@@ -699,7 +707,7 @@ func TestMoveWithMultipartCopy(t *testing.T) {
 	}
 
 	rootDir := t.TempDir()
-	d, err := s3DriverConstructor(rootDir, s3.StorageClassStandard)
+	d, err := s3DriverConstructor(rootDir, s3types.StorageClassStandard)
 	if err != nil {
 		t.Fatalf("unexpected error creating driver: %v", err)
 	}
@@ -748,7 +756,7 @@ func TestListObjectsV2(t *testing.T) {
 	}
 
 	rootDir := t.TempDir()
-	d, err := s3DriverConstructor(rootDir, s3.StorageClassStandard)
+	d, err := s3DriverConstructor(rootDir, s3types.StorageClassStandard)
 	if err != nil {
 		t.Fatalf("unexpected error creating driver: %v", err)
 	}

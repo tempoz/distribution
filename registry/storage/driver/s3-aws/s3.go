@@ -27,14 +27,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 
+	awssignerv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	dcontext "github.com/distribution/distribution/v3/context"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/base"
@@ -75,22 +76,22 @@ const listMax = 1000
 const noStorageClass = "NONE"
 
 // s3StorageClasses lists all compatible (instant retrieval) S3 storage classes
-var s3StorageClasses = []string{
-	noStorageClass,
-	s3.StorageClassStandard,
-	s3.StorageClassReducedRedundancy,
-	s3.StorageClassStandardIa,
-	s3.StorageClassOnezoneIa,
-	s3.StorageClassIntelligentTiering,
-	s3.StorageClassOutposts,
-	s3.StorageClassGlacierIr,
+var s3StorageClasses = []s3types.StorageClass{
+	s3types.StorageClassStandard,
+	s3types.StorageClassStandard,
+	s3types.StorageClassReducedRedundancy,
+	s3types.StorageClassStandardIa,
+	s3types.StorageClassOnezoneIa,
+	s3types.StorageClassIntelligentTiering,
+	s3types.StorageClassOutposts,
+	s3types.StorageClassGlacierIr,
 }
 
 // validRegions maps known s3 region identifiers to region descriptors
 var validRegions = map[string]struct{}{}
 
 // validObjectACLs contains known s3 object Acls
-var validObjectACLs = map[string]struct{}{}
+var validObjectACLs = map[s3types.ObjectCannedACL]struct{}{}
 
 // DriverParameters A struct that encapsulates all of the driver parameters after all values have been set
 type DriverParameters struct {
@@ -107,34 +108,28 @@ type DriverParameters struct {
 	V4Auth                      bool
 	ChunkSize                   int64
 	MultipartCopyChunkSize      int64
-	MultipartCopyMaxConcurrency int64
+	MultipartCopyMaxConcurrency int32
 	MultipartCopyThresholdSize  int64
 	MultipartCombineSmallPart   bool
 	RootDirectory               string
-	StorageClass                string
+	StorageClass                s3types.StorageClass
 	UserAgent                   string
-	ObjectACL                   string
+	ObjectACL                   s3types.ObjectCannedACL
 	SessionToken                string
-	UseDualStack                bool
+	UseDualStack                aws.DualStackEndpointState
 	Accelerate                  bool
 }
 
 func init() {
-	partitions := endpoints.DefaultPartitions()
-	for _, p := range partitions {
-		for region := range p.Regions() {
-			validRegions[region] = struct{}{}
-		}
-	}
 
-	for _, objectACL := range []string{
-		s3.ObjectCannedACLPrivate,
-		s3.ObjectCannedACLPublicRead,
-		s3.ObjectCannedACLPublicReadWrite,
-		s3.ObjectCannedACLAuthenticatedRead,
-		s3.ObjectCannedACLAwsExecRead,
-		s3.ObjectCannedACLBucketOwnerRead,
-		s3.ObjectCannedACLBucketOwnerFullControl,
+	for _, objectACL := range []s3types.ObjectCannedACL{
+		s3types.ObjectCannedACLPrivate,
+		s3types.ObjectCannedACLPublicRead,
+		s3types.ObjectCannedACLPublicReadWrite,
+		s3types.ObjectCannedACLAuthenticatedRead,
+		s3types.ObjectCannedACLAwsExecRead,
+		s3types.ObjectCannedACLBucketOwnerRead,
+		s3types.ObjectCannedACLBucketOwnerFullControl,
 	} {
 		validObjectACLs[objectACL] = struct{}{}
 	}
@@ -152,18 +147,18 @@ func (factory *s3DriverFactory) Create(parameters map[string]interface{}) (stora
 }
 
 type driver struct {
-	S3                          *s3.S3
+	S3                          *s3.Client
 	Bucket                      string
 	ChunkSize                   int64
 	Encrypt                     bool
 	KeyID                       string
 	MultipartCopyChunkSize      int64
-	MultipartCopyMaxConcurrency int64
+	MultipartCopyMaxConcurrency int32
 	MultipartCopyThresholdSize  int64
 	MultipartCombineSmallPart   bool
 	RootDirectory               string
-	StorageClass                string
-	ObjectACL                   string
+	StorageClass                s3types.StorageClass
+	ObjectACL                   s3types.ObjectCannedACL
 }
 
 type baseEmbed struct {
@@ -218,6 +213,31 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		return nil, fmt.Errorf("the forcePathStyle parameter should be a boolean")
 	}
 
+	useDualStack := parameters["usedualstack"]
+	useDualStackState := aws.DualStackEndpointStateUnset
+	switch useDualStack := useDualStack.(type) {
+	case string:
+		b, err := strconv.ParseBool(useDualStack)
+		if err != nil {
+			return nil, fmt.Errorf("the useDualStack parameter should be a boolean")
+		}
+		if b {
+			useDualStackState = aws.DualStackEndpointStateEnabled
+		} else {
+			useDualStackState = aws.DualStackEndpointStateDisabled
+		}
+	case bool:
+		if useDualStack {
+			useDualStackState = aws.DualStackEndpointStateEnabled
+		} else {
+			useDualStackState = aws.DualStackEndpointStateDisabled
+		}
+	case nil:
+		// do nothing
+	default:
+		return nil, fmt.Errorf("the useDualStack parameter should be a boolean")
+	}
+
 	regionName := parameters["region"]
 	if regionName == nil || fmt.Sprint(regionName) == "" {
 		return nil, fmt.Errorf("no region parameter provided")
@@ -225,7 +245,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	region := fmt.Sprint(regionName)
 	// Don't check the region value if a custom endpoint is provided.
 	if regionEndpoint == "" {
-		if _, ok := validRegions[region]; !ok {
+		if _, err := s3.NewDefaultEndpointResolver().ResolveEndpoint(region, s3.EndpointResolverOptions{UseDualStackEndpoint: useDualStackState}); err != nil {
 			return nil, fmt.Errorf("invalid region provided: %v", region)
 		}
 	}
@@ -318,7 +338,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		return nil, err
 	}
 
-	multipartCopyMaxConcurrency, err := getParameterAsInt64(parameters, "multipartcopymaxconcurrency", defaultMultipartCopyMaxConcurrency, 1, math.MaxInt64)
+	multipartCopyMaxConcurrency, err := getParameterAsInt32(parameters, "multipartcopymaxconcurrency", defaultMultipartCopyMaxConcurrency, 1, math.MaxInt32)
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +353,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		rootDirectory = ""
 	}
 
-	storageClass := s3.StorageClassStandard
+	storageClass := s3types.StorageClassStandard
 	storageClassParam := parameters["storageclass"]
 	if storageClassParam != nil {
 		storageClassString, ok := storageClassParam.(string)
@@ -345,22 +365,21 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 			)
 		}
 		// All valid storage class parameters are UPPERCASE, so be a bit more flexible here
-		storageClassString = strings.ToUpper(storageClassString)
-		if storageClassString != noStorageClass &&
-			storageClassString != s3.StorageClassStandard &&
-			storageClassString != s3.StorageClassReducedRedundancy &&
-			storageClassString != s3.StorageClassStandardIa &&
-			storageClassString != s3.StorageClassOnezoneIa &&
-			storageClassString != s3.StorageClassIntelligentTiering &&
-			storageClassString != s3.StorageClassOutposts &&
-			storageClassString != s3.StorageClassGlacierIr {
+		storageClass = s3types.StorageClass(strings.ToUpper(storageClassString))
+		if storageClass != noStorageClass &&
+			storageClass != s3types.StorageClassStandard &&
+			storageClass != s3types.StorageClassReducedRedundancy &&
+			storageClass != s3types.StorageClassStandardIa &&
+			storageClass != s3types.StorageClassOnezoneIa &&
+			storageClass != s3types.StorageClassIntelligentTiering &&
+			storageClass != s3types.StorageClassOutposts &&
+			storageClass != s3types.StorageClassGlacierIr {
 			return nil, fmt.Errorf(
 				"the storageclass parameter must be one of %v, %v invalid",
 				s3StorageClasses,
 				storageClassParam,
 			)
 		}
-		storageClass = storageClassString
 	}
 
 	userAgent := parameters["useragent"]
@@ -368,7 +387,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		userAgent = ""
 	}
 
-	objectACL := s3.ObjectCannedACLPrivate
+	objectACL := s3types.ObjectCannedACLPrivate
 	objectACLParam := parameters["objectacl"]
 	if objectACLParam != nil {
 		objectACLString, ok := objectACLParam.(string)
@@ -376,27 +395,10 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 			return nil, fmt.Errorf("invalid value for objectacl parameter: %v", objectACLParam)
 		}
 
-		if _, ok = validObjectACLs[objectACLString]; !ok {
+		objectACL = s3types.ObjectCannedACL(objectACLString)
+		if _, ok = validObjectACLs[objectACL]; !ok {
 			return nil, fmt.Errorf("invalid value for objectacl parameter: %v", objectACLParam)
 		}
-		objectACL = objectACLString
-	}
-
-	useDualStackBool := false
-	useDualStack := parameters["usedualstack"]
-	switch useDualStack := useDualStack.(type) {
-	case string:
-		b, err := strconv.ParseBool(useDualStack)
-		if err != nil {
-			return nil, fmt.Errorf("the useDualStack parameter should be a boolean")
-		}
-		useDualStackBool = b
-	case bool:
-		useDualStackBool = useDualStack
-	case nil:
-		// do nothing
-	default:
-		return nil, fmt.Errorf("the useDualStack parameter should be a boolean")
 	}
 
 	mutlipartCombineSmallPart := true
@@ -457,7 +459,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		fmt.Sprint(userAgent),
 		objectACL,
 		fmt.Sprint(sessionToken),
-		useDualStackBool,
+		useDualStackState,
 		accelerateBool,
 	}
 
@@ -493,6 +495,42 @@ func getParameterAsInt64(parameters map[string]interface{}, name string, default
 	return rv, nil
 }
 
+// getParameterAsInt32 converts parameters[name] to an int64 value (using
+// defaultt if nil), verifies it is no smaller than min, and returns it.
+func getParameterAsInt32(parameters map[string]interface{}, name string, defaultt int32, min int32, max int32) (int32, error) {
+	rv := defaultt
+	param := parameters[name]
+	switch v := param.(type) {
+	case string:
+		vv, err := strconv.ParseInt(v, 0, 32)
+		if err != nil {
+			return 0, fmt.Errorf("%s parameter must be an int32, %v invalid", name, param)
+		}
+		rv = int32(vv)
+	case int64:
+		if v > math.MaxInt32 || v < math.MinInt32 {
+			return 0, fmt.Errorf("%s parameter must be an int32, %v invalid", name, param)
+		}
+		rv = int32(v)
+	case int, uint, int32, uint32, uint64:
+		vv := reflect.ValueOf(v).Convert(reflect.TypeOf(rv)).Int()
+		if vv > math.MaxInt32 || vv < math.MinInt32 {
+			return 0, fmt.Errorf("%s parameter must be an int32, %v invalid", name, param)
+		}
+		rv = int32(vv)
+	case nil:
+		// do nothing
+	default:
+		return 0, fmt.Errorf("invalid value for %s: %#v", name, param)
+	}
+
+	if rv < min || rv > max {
+		return 0, fmt.Errorf("the %s %#v parameter should be a number between %d and %d (inclusive)", name, rv, min, max)
+	}
+
+	return rv, nil
+}
+
 // New constructs a new Driver with the given AWS credentials, region, encryption flag, and
 // bucketName
 func New(params DriverParameters) (*Driver, error) {
@@ -502,53 +540,66 @@ func New(params DriverParameters) (*Driver, error) {
 		return nil, fmt.Errorf("on Amazon S3 this storage driver can only be used with v4 authentication")
 	}
 
-	awsConfig := aws.NewConfig()
-
+	configOptions := []func(*config.LoadOptions) error{}
 	if params.AccessKey != "" && params.SecretKey != "" {
-		creds := credentials.NewStaticCredentials(
-			params.AccessKey,
-			params.SecretKey,
-			params.SessionToken,
-		)
-		awsConfig.WithCredentials(creds)
+		configOptions = append(configOptions, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(
+				params.AccessKey,
+				params.SecretKey,
+				params.SessionToken,
+			),
+		))
 	}
 
 	if params.RegionEndpoint != "" {
-		awsConfig.WithEndpoint(params.RegionEndpoint)
-		awsConfig.WithS3ForcePathStyle(params.ForcePathStyle)
+		configOptions = append(configOptions, config.WithEndpointResolverWithOptions(
+			aws.EndpointResolverWithOptionsFunc(
+				func(_, _ string, _ ...interface{}) (aws.Endpoint, error) {
+					return aws.Endpoint{
+						URL:               params.RegionEndpoint,
+						SigningRegion:     params.Region,
+					}, nil
+				},
+			),
+		))
 	}
 
-	awsConfig.WithS3UseAccelerate(params.Accelerate)
-	awsConfig.WithRegion(params.Region)
-	awsConfig.WithDisableSSL(!params.Secure)
-	if params.UseDualStack {
-		awsConfig.UseDualStackEndpoint = endpoints.DualStackEndpointStateEnabled
-	}
+	configOptions = append(configOptions, config.WithRegion(params.Region))
+	configOptions = append(configOptions, config.WithUseDualStackEndpoint(params.UseDualStack))
 
 	if params.SkipVerify {
 		httpTransport := &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}
-		awsConfig.WithHTTPClient(&http.Client{
-			Transport: httpTransport,
-		})
+		configOptions = append(configOptions, config.WithHTTPClient(
+			&http.Client{ Transport: httpTransport },
+		))
 	}
 
-	sess, err := session.NewSession(awsConfig)
+	cfg, err := config.LoadDefaultConfig(context.Background(), configOptions...)
+	if err != nil {
+		return nil, err
+	}
+
+	client := s3.NewFromConfig(
+		cfg,
+		func(o *s3.Options) {
+			o.UsePathStyle = params.ForcePathStyle
+			o.UseAccelerate = params.Accelerate
+			if params.UserAgent != "" {
+				o.APIOptions = append(o.APIOptions, awsmiddleware.AddUserAgentKey(params.UserAgent))
+			}
+			// enable S3 compatible signature v2 signing instead
+			if !params.V4Auth {
+				o.APIOptions = append(o.APIOptions, setv2Handlers)
+			}
+			// o.APIOptions = append(o.APIOptions, s3.)
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create new session with aws config: %v", err)
 	}
 
-	if params.UserAgent != "" {
-		sess.Handlers.Build.PushBack(request.MakeAddToUserAgentFreeFormHandler(params.UserAgent))
-	}
-
-	s3obj := s3.New(sess)
-
-	// enable S3 compatible signature v2 signing instead
-	if !params.V4Auth {
-		setv2Handlers(s3obj)
-	}
 
 	// TODO Currently multipart uploads have no timestamps, so this would be unwise
 	// if you initiated a new s3driver while another one is running on the same bucket.
@@ -566,7 +617,7 @@ func New(params DriverParameters) (*Driver, error) {
 	// }
 
 	d := &driver{
-		S3:                          s3obj,
+		S3:                          client,
 		Bucket:                      params.Bucket,
 		ChunkSize:                   params.ChunkSize,
 		Encrypt:                     params.Encrypt,
@@ -606,7 +657,7 @@ func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
 
 // PutContent stores the []byte content at a location designated by "path".
 func (d *driver) PutContent(ctx context.Context, path string, contents []byte) error {
-	_, err := d.S3.PutObject(&s3.PutObjectInput{
+	_, err := d.S3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:               aws.String(d.Bucket),
 		Key:                  aws.String(d.s3Path(path)),
 		ContentType:          d.getContentType(),
@@ -622,13 +673,14 @@ func (d *driver) PutContent(ctx context.Context, path string, contents []byte) e
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
 // given byte offset.
 func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
-	resp, err := d.S3.GetObject(&s3.GetObjectInput{
+	resp, err := d.S3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(d.Bucket),
 		Key:    aws.String(d.s3Path(path)),
 		Range:  aws.String("bytes=" + strconv.FormatInt(offset, 10) + "-"),
 	})
 	if err != nil {
-		if s3Err, ok := err.(awserr.Error); ok && s3Err.Code() == "InvalidRange" {
+		var ae smithy.APIError
+		if ok := errors.As(err, &ae); ok && ae.ErrorCode() != "InvalidRange" {
 			return io.NopCloser(bytes.NewReader(nil)), nil
 		}
 
@@ -643,7 +695,7 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 	key := d.s3Path(path)
 	if !appendParam {
 		// TODO (brianbland): cancel other uploads at this path
-		resp, err := d.S3.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
+		resp, err := d.S3.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 			Bucket:               aws.String(d.Bucket),
 			Key:                  aws.String(key),
 			ContentType:          d.getContentType(),
@@ -663,7 +715,7 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 		Prefix: aws.String(key),
 	}
 	for {
-		resp, err := d.S3.ListMultipartUploads(listMultipartUploadsInput)
+		resp, err := d.S3.ListMultipartUploads(ctx, listMultipartUploadsInput)
 		if err != nil {
 			return nil, parseError(path, err)
 		}
@@ -675,13 +727,13 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 			break
 		}
 
-		var allParts []*s3.Part
+		var allParts []s3types.Part
 		for _, multi := range resp.Uploads {
 			if key != *multi.Key {
 				continue
 			}
 
-			partsList, err := d.S3.ListParts(&s3.ListPartsInput{
+			partsList, err := d.S3.ListParts(ctx, &s3.ListPartsInput{
 				Bucket:   aws.String(d.Bucket),
 				Key:      aws.String(key),
 				UploadId: multi.UploadId,
@@ -690,8 +742,8 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 				return nil, parseError(path, err)
 			}
 			allParts = append(allParts, partsList.Parts...)
-			for *partsList.IsTruncated {
-				partsList, err = d.S3.ListParts(&s3.ListPartsInput{
+			for partsList.IsTruncated {
+				partsList, err = d.S3.ListParts(ctx, &s3.ListPartsInput{
 					Bucket:           aws.String(d.Bucket),
 					Key:              aws.String(key),
 					UploadId:         multi.UploadId,
@@ -710,7 +762,7 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 
 		// from the s3 api docs, IsTruncated "specifies whether (true) or not (false) all of the results were returned"
 		// if everything has been returned, break
-		if resp.IsTruncated == nil || !*resp.IsTruncated {
+		if !resp.IsTruncated {
 			break
 		}
 	}
@@ -720,10 +772,10 @@ func (d *driver) Writer(ctx context.Context, path string, appendParam bool) (sto
 // Stat retrieves the FileInfo for the given path, including the current size
 // in bytes and the creation time.
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
-	resp, err := d.S3.ListObjectsV2(&s3.ListObjectsV2Input{
+	resp, err := d.S3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket:  aws.String(d.Bucket),
 		Prefix:  aws.String(d.s3Path(path)),
-		MaxKeys: aws.Int64(1),
+		MaxKeys: 1,
 	})
 	if err != nil {
 		return nil, err
@@ -738,7 +790,7 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 			fi.IsDir = true
 		} else {
 			fi.IsDir = false
-			fi.Size = *resp.Contents[0].Size
+			fi.Size = resp.Contents[0].Size
 			fi.ModTime = *resp.Contents[0].LastModified
 		}
 	} else if len(resp.CommonPrefixes) == 1 {
@@ -765,11 +817,11 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 		prefix = "/"
 	}
 
-	resp, err := d.S3.ListObjectsV2(&s3.ListObjectsV2Input{
+	resp, err := d.S3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(d.Bucket),
 		Prefix:    aws.String(d.s3Path(path)),
 		Delimiter: aws.String("/"),
-		MaxKeys:   aws.Int64(listMax),
+		MaxKeys:   listMax,
 	})
 	if err != nil {
 		return nil, parseError(opath, err)
@@ -788,12 +840,12 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 			directories = append(directories, strings.Replace(commonPrefix[0:len(commonPrefix)-1], d.s3Path(""), prefix, 1))
 		}
 
-		if *resp.IsTruncated {
-			resp, err = d.S3.ListObjectsV2(&s3.ListObjectsV2Input{
+		if resp.IsTruncated {
+			resp, err = d.S3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 				Bucket:            aws.String(d.Bucket),
 				Prefix:            aws.String(d.s3Path(path)),
 				Delimiter:         aws.String("/"),
-				MaxKeys:           aws.Int64(listMax),
+				MaxKeys:           listMax,
 				ContinuationToken: resp.NextContinuationToken,
 			})
 			if err != nil {
@@ -839,7 +891,7 @@ func (d *driver) copy(ctx context.Context, sourcePath string, destPath string) e
 	}
 
 	if fileInfo.Size() <= d.MultipartCopyThresholdSize {
-		_, err := d.S3.CopyObject(&s3.CopyObjectInput{
+		_, err := d.S3.CopyObject(ctx, &s3.CopyObjectInput{
 			Bucket:               aws.String(d.Bucket),
 			Key:                  aws.String(d.s3Path(destPath)),
 			ContentType:          d.getContentType(),
@@ -855,7 +907,7 @@ func (d *driver) copy(ctx context.Context, sourcePath string, destPath string) e
 		return nil
 	}
 
-	createResp, err := d.S3.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
+	createResp, err := d.S3.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:               aws.String(d.Bucket),
 		Key:                  aws.String(d.s3Path(destPath)),
 		ContentType:          d.getContentType(),
@@ -869,31 +921,31 @@ func (d *driver) copy(ctx context.Context, sourcePath string, destPath string) e
 	}
 
 	numParts := (fileInfo.Size() + d.MultipartCopyChunkSize - 1) / d.MultipartCopyChunkSize
-	completedParts := make([]*s3.CompletedPart, numParts)
+	completedParts := make([]s3types.CompletedPart, numParts)
 	errChan := make(chan error, numParts)
 	limiter := make(chan struct{}, d.MultipartCopyMaxConcurrency)
 
 	for i := range completedParts {
-		i := int64(i)
+		i := int32(i)
 		go func() {
 			limiter <- struct{}{}
-			firstByte := i * d.MultipartCopyChunkSize
+			firstByte := int64(i) * d.MultipartCopyChunkSize
 			lastByte := firstByte + d.MultipartCopyChunkSize - 1
 			if lastByte >= fileInfo.Size() {
 				lastByte = fileInfo.Size() - 1
 			}
-			uploadResp, err := d.S3.UploadPartCopy(&s3.UploadPartCopyInput{
+			uploadResp, err := d.S3.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
 				Bucket:          aws.String(d.Bucket),
 				CopySource:      aws.String(d.Bucket + "/" + d.s3Path(sourcePath)),
 				Key:             aws.String(d.s3Path(destPath)),
-				PartNumber:      aws.Int64(i + 1),
+				PartNumber:      i + 1,
 				UploadId:        createResp.UploadId,
 				CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", firstByte, lastByte)),
 			})
 			if err == nil {
-				completedParts[i] = &s3.CompletedPart{
+				completedParts[i] = s3types.CompletedPart{
 					ETag:       uploadResp.CopyPartResult.ETag,
-					PartNumber: aws.Int64(i + 1),
+					PartNumber: i + 1,
 				}
 			}
 			errChan <- err
@@ -908,11 +960,11 @@ func (d *driver) copy(ctx context.Context, sourcePath string, destPath string) e
 		}
 	}
 
-	_, err = d.S3.CompleteMultipartUpload(&s3.CompleteMultipartUploadInput{
+	_, err = d.S3.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:          aws.String(d.Bucket),
 		Key:             aws.String(d.s3Path(destPath)),
 		UploadId:        createResp.UploadId,
-		MultipartUpload: &s3.CompletedMultipartUpload{Parts: completedParts},
+		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: completedParts},
 	})
 	return err
 }
@@ -920,7 +972,7 @@ func (d *driver) copy(ctx context.Context, sourcePath string, destPath string) e
 // Delete recursively deletes all objects stored at "path" and its subpaths.
 // We must be careful since S3 does not guarantee read after delete consistency
 func (d *driver) Delete(ctx context.Context, path string) error {
-	s3Objects := make([]*s3.ObjectIdentifier, 0, listMax)
+	s3Objects := make([]s3types.ObjectIdentifier, 0, listMax)
 	s3Path := d.s3Path(path)
 	listObjectsInput := &s3.ListObjectsV2Input{
 		Bucket: aws.String(d.Bucket),
@@ -929,7 +981,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 
 	for {
 		// list all the objects
-		resp, err := d.S3.ListObjectsV2(listObjectsInput)
+		resp, err := d.S3.ListObjectsV2(ctx, listObjectsInput)
 
 		// resp.Contents can only be empty on the first call
 		// if there were no more results to return after the first call, resp.IsTruncated would have been false
@@ -943,7 +995,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 			if len(*key.Key) > len(s3Path) && (*key.Key)[len(s3Path)] != '/' {
 				continue
 			}
-			s3Objects = append(s3Objects, &s3.ObjectIdentifier{
+			s3Objects = append(s3Objects, s3types.ObjectIdentifier{
 				Key: key.Key,
 			})
 		}
@@ -954,11 +1006,11 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 			// by default the response returns up to 1,000 key names. The response _might_ contain fewer keys but it will never contain more.
 			// 10000 keys is coincidentally (?) also the max number of keys that can be deleted in a single Delete operation, so we'll just smack
 			// Delete here straight away and reset the object slice when successful.
-			resp, err := d.S3.DeleteObjects(&s3.DeleteObjectsInput{
+			resp, err := d.S3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 				Bucket: aws.String(d.Bucket),
-				Delete: &s3.Delete{
+				Delete: &s3types.Delete{
 					Objects: s3Objects,
-					Quiet:   aws.Bool(false),
+					Quiet:   false,
 				},
 			})
 			if err != nil {
@@ -970,7 +1022,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 				// is pretty intensely sad, so we have to do away with this for now.
 				errs := make([]error, 0, len(resp.Errors))
 				for _, err := range resp.Errors {
-					errs = append(errs, errors.New(err.String()))
+					errs = append(errs, errors.New(*err.Message))
 				}
 				return storagedriver.Errors{
 					DriverName: driverName,
@@ -987,7 +1039,7 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 
 		// from the s3 api docs, IsTruncated "specifies whether (true) or not (false) all of the results were returned"
 		// if everything has been returned, break
-		if resp.IsTruncated == nil || !*resp.IsTruncated {
+		if !resp.IsTruncated {
 			break
 		}
 	}
@@ -1016,16 +1068,19 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 		}
 	}
 
-	var req *request.Request
+	var req *awssignerv4.PresignedHTTPRequest
+	pc := s3.NewPresignClient(d.S3, func(po *s3.PresignOptions) {
+		po.Expires = expiresIn
+	})
 
 	switch methodString {
 	case http.MethodGet:
-		req, _ = d.S3.GetObjectRequest(&s3.GetObjectInput{
+		req, _ = pc.PresignGetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(d.Bucket),
 			Key:    aws.String(d.s3Path(path)),
 		})
 	case http.MethodHead:
-		req, _ = d.S3.HeadObjectRequest(&s3.HeadObjectInput{
+		req, _ = pc.PresignHeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(d.Bucket),
 			Key:    aws.String(d.s3Path(path)),
 		})
@@ -1033,7 +1088,7 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 		panic("unreachable")
 	}
 
-	return req.Presign(expiresIn)
+	return req.URL, nil
 }
 
 // Walk traverses a filesystem defined within driver, starting
@@ -1064,7 +1119,6 @@ func (d *driver) Walk(ctx context.Context, from string, f storagedriver.WalkFn) 
 
 func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, path, prefix string, f storagedriver.WalkFn) error {
 	var (
-		retError error
 		// the most recent directory walked for de-duping
 		prevDir string
 		// the most recent skip directory to avoid walking over undesirable files
@@ -1075,7 +1129,7 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, path, pre
 	listObjectsInput := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(d.Bucket),
 		Prefix:  aws.String(path),
-		MaxKeys: aws.Int64(listMax),
+		MaxKeys: listMax,
 	}
 
 	ctx, done := dcontext.WithTrace(parentCtx)
@@ -1090,7 +1144,12 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, path, pre
 	// ErrSkipDir is handled by explicitly skipping over any files under the skipped directory. This may be sub-optimal
 	// for extreme edge cases but for the general use case in a registry, this is orders of magnitude
 	// faster than a more explicit recursive implementation.
-	listObjectErr := d.S3.ListObjectsV2PagesWithContext(ctx, listObjectsInput, func(objects *s3.ListObjectsV2Output, lastPage bool) bool {
+	listObjectsPaginator := s3.NewListObjectsV2Paginator(d.S3, listObjectsInput)
+	for listObjectsPaginator.HasMorePages() {
+		objects, err := listObjectsPaginator.NextPage(ctx)
+		if err != nil {
+			return err
+		}
 		walkInfos := make([]storagedriver.FileInfoInternal, 0, len(objects.Contents))
 
 		for _, file := range objects.Contents {
@@ -1113,7 +1172,7 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, path, pre
 			walkInfos = append(walkInfos, storagedriver.FileInfoInternal{
 				FileInfoFields: storagedriver.FileInfoFields{
 					IsDir:   false,
-					Size:    *file.Size,
+					Size:    file.Size,
 					ModTime: *file.LastModified,
 					Path:    filePath,
 				},
@@ -1136,21 +1195,11 @@ func (d *driver) doWalk(parentCtx context.Context, objectCount *int64, path, pre
 						continue
 					}
 					// is file, stop gracefully
-					return false
+					break
 				}
-				retError = err
-				return false
+				return err
 			}
 		}
-		return true
-	})
-
-	if retError != nil {
-		return retError
-	}
-
-	if listObjectErr != nil {
-		return listObjectErr
 	}
 
 	return nil
@@ -1210,21 +1259,22 @@ func (d *Driver) S3BucketKey(path string) string {
 }
 
 func parseError(path string, err error) error {
-	if s3Err, ok := err.(awserr.Error); ok && s3Err.Code() == "NoSuchKey" {
+	var nsk *s3types.NoSuchKey
+	if errors.As(err, &nsk) {
 		return storagedriver.PathNotFoundError{Path: path}
 	}
 
 	return err
 }
 
-func (d *driver) getEncryptionMode() *string {
+func (d *driver) getEncryptionMode() s3types.ServerSideEncryption {
 	if !d.Encrypt {
-		return nil
+		return *new(s3types.ServerSideEncryption)
 	}
 	if d.KeyID == "" {
-		return aws.String("AES256")
+		return s3types.ServerSideEncryptionAes256
 	}
-	return aws.String("aws:kms")
+	return s3types.ServerSideEncryptionAwsKms
 }
 
 func (d *driver) getSSEKMSKeyID() *string {
@@ -1238,15 +1288,15 @@ func (d *driver) getContentType() *string {
 	return aws.String("application/octet-stream")
 }
 
-func (d *driver) getACL() *string {
-	return aws.String(d.ObjectACL)
+func (d *driver) getACL() s3types.ObjectCannedACL {
+	return d.ObjectACL
 }
 
-func (d *driver) getStorageClass() *string {
+func (d *driver) getStorageClass() s3types.StorageClass {
 	if d.StorageClass == noStorageClass {
-		return nil
+		return *new(s3types.StorageClass)
 	}
-	return aws.String(d.StorageClass)
+	return d.StorageClass
 }
 
 // writer attempts to upload parts to S3 in a buffered fashion where the last
@@ -1257,7 +1307,7 @@ type writer struct {
 	driver      *driver
 	key         string
 	uploadID    string
-	parts       []*s3.Part
+	parts       []s3types.Part
 	size        int64
 	readyPart   []byte
 	pendingPart []byte
@@ -1266,10 +1316,10 @@ type writer struct {
 	cancelled   bool
 }
 
-func (d *driver) newWriter(key, uploadID string, parts []*s3.Part) storagedriver.FileWriter {
+func (d *driver) newWriter(key, uploadID string, parts []s3types.Part) storagedriver.FileWriter {
 	var size int64
 	for _, part := range parts {
-		size += *part.Size
+		size += part.Size
 	}
 	return &writer{
 		driver:   d,
@@ -1280,11 +1330,11 @@ func (d *driver) newWriter(key, uploadID string, parts []*s3.Part) storagedriver
 	}
 }
 
-type completedParts []*s3.CompletedPart
+type completedParts []s3types.CompletedPart
 
 func (a completedParts) Len() int           { return len(a) }
 func (a completedParts) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a completedParts) Less(i, j int) bool { return *a[i].PartNumber < *a[j].PartNumber }
+func (a completedParts) Less(i, j int) bool { return a[i].PartNumber < a[j].PartNumber }
 
 func (w *writer) Write(p []byte) (int, error) {
 	if w.closed {
@@ -1297,10 +1347,10 @@ func (w *writer) Write(p []byte) (int, error) {
 
 	// If the last written part is smaller than minChunkSize, we need to make a
 	// new multipart upload :sadface:
-	if len(w.parts) > 0 && int(*w.parts[len(w.parts)-1].Size) < minChunkSize {
+	if len(w.parts) > 0 && int(w.parts[len(w.parts)-1].Size) < minChunkSize {
 		var completedUploadedParts completedParts
 		for _, part := range w.parts {
-			completedUploadedParts = append(completedUploadedParts, &s3.CompletedPart{
+			completedUploadedParts = append(completedUploadedParts, s3types.CompletedPart{
 				ETag:       part.ETag,
 				PartNumber: part.PartNumber,
 			})
@@ -1308,16 +1358,16 @@ func (w *writer) Write(p []byte) (int, error) {
 
 		sort.Sort(completedUploadedParts)
 
-		_, err := w.driver.S3.CompleteMultipartUpload(&s3.CompleteMultipartUploadInput{
+		_, err := w.driver.S3.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
 			Bucket:   aws.String(w.driver.Bucket),
 			Key:      aws.String(w.key),
 			UploadId: aws.String(w.uploadID),
-			MultipartUpload: &s3.CompletedMultipartUpload{
+			MultipartUpload: &s3types.CompletedMultipartUpload{
 				Parts: completedUploadedParts,
 			},
 		})
 		if err != nil {
-			w.driver.S3.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+			w.driver.S3.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
 				Bucket:   aws.String(w.driver.Bucket),
 				Key:      aws.String(w.key),
 				UploadId: aws.String(w.uploadID),
@@ -1325,7 +1375,7 @@ func (w *writer) Write(p []byte) (int, error) {
 			return 0, err
 		}
 
-		resp, err := w.driver.S3.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
+		resp, err := w.driver.S3.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{
 			Bucket:               aws.String(w.driver.Bucket),
 			Key:                  aws.String(w.key),
 			ContentType:          w.driver.getContentType(),
@@ -1341,7 +1391,7 @@ func (w *writer) Write(p []byte) (int, error) {
 		// If the entire written file is smaller than minChunkSize, we need to make
 		// a new part from scratch :double sad face:
 		if w.size < minChunkSize {
-			resp, err := w.driver.S3.GetObject(&s3.GetObjectInput{
+			resp, err := w.driver.S3.GetObject(context.Background(), &s3.GetObjectInput{
 				Bucket: aws.String(w.driver.Bucket),
 				Key:    aws.String(w.key),
 			})
@@ -1356,21 +1406,21 @@ func (w *writer) Write(p []byte) (int, error) {
 			}
 		} else {
 			// Otherwise we can use the old file as the new first part
-			copyPartResp, err := w.driver.S3.UploadPartCopy(&s3.UploadPartCopyInput{
+			copyPartResp, err := w.driver.S3.UploadPartCopy(context.Background(), &s3.UploadPartCopyInput{
 				Bucket:     aws.String(w.driver.Bucket),
 				CopySource: aws.String(w.driver.Bucket + "/" + w.key),
 				Key:        aws.String(w.key),
-				PartNumber: aws.Int64(1),
+				PartNumber: 1,
 				UploadId:   resp.UploadId,
 			})
 			if err != nil {
 				return 0, err
 			}
-			w.parts = []*s3.Part{
+			w.parts = []s3types.Part{
 				{
 					ETag:       copyPartResp.CopyPartResult.ETag,
-					PartNumber: aws.Int64(1),
-					Size:       aws.Int64(w.size),
+					PartNumber: 1,
+					Size:       w.size,
 				},
 			}
 		}
@@ -1432,7 +1482,7 @@ func (w *writer) Cancel(ctx context.Context) error {
 		return fmt.Errorf("already committed")
 	}
 	w.cancelled = true
-	_, err := w.driver.S3.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+	_, err := w.driver.S3.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   aws.String(w.driver.Bucket),
 		Key:      aws.String(w.key),
 		UploadId: aws.String(w.uploadID),
@@ -1456,7 +1506,7 @@ func (w *writer) Commit() error {
 
 	var completedUploadedParts completedParts
 	for _, part := range w.parts {
-		completedUploadedParts = append(completedUploadedParts, &s3.CompletedPart{
+		completedUploadedParts = append(completedUploadedParts, s3types.CompletedPart{
 			ETag:       part.ETag,
 			PartNumber: part.PartNumber,
 		})
@@ -1469,10 +1519,10 @@ func (w *writer) Commit() error {
 	// Solution: we upload an empty i.e. 0 byte part as a single part and then append it
 	// to the completedUploadedParts slice used to complete the Multipart upload.
 	if len(w.parts) == 0 {
-		resp, err := w.driver.S3.UploadPart(&s3.UploadPartInput{
+		resp, err := w.driver.S3.UploadPart(context.Background(), &s3.UploadPartInput{
 			Bucket:     aws.String(w.driver.Bucket),
 			Key:        aws.String(w.key),
-			PartNumber: aws.Int64(1),
+			PartNumber: 1,
 			UploadId:   aws.String(w.uploadID),
 			Body:       bytes.NewReader(nil),
 		})
@@ -1480,24 +1530,24 @@ func (w *writer) Commit() error {
 			return err
 		}
 
-		completedUploadedParts = append(completedUploadedParts, &s3.CompletedPart{
+		completedUploadedParts = append(completedUploadedParts, s3types.CompletedPart{
 			ETag:       resp.ETag,
-			PartNumber: aws.Int64(1),
+			PartNumber: 1,
 		})
 	}
 
 	sort.Sort(completedUploadedParts)
 
-	_, err = w.driver.S3.CompleteMultipartUpload(&s3.CompleteMultipartUploadInput{
+	_, err = w.driver.S3.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{
 		Bucket:   aws.String(w.driver.Bucket),
 		Key:      aws.String(w.key),
 		UploadId: aws.String(w.uploadID),
-		MultipartUpload: &s3.CompletedMultipartUpload{
+		MultipartUpload: &s3types.CompletedMultipartUpload{
 			Parts: completedUploadedParts,
 		},
 	})
 	if err != nil {
-		w.driver.S3.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+		w.driver.S3.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
 			Bucket:   aws.String(w.driver.Bucket),
 			Key:      aws.String(w.key),
 			UploadId: aws.String(w.uploadID),
@@ -1521,8 +1571,8 @@ func (w *writer) flushPart() error {
 		w.pendingPart = nil
 	}
 
-	partNumber := aws.Int64(int64(len(w.parts) + 1))
-	resp, err := w.driver.S3.UploadPart(&s3.UploadPartInput{
+	partNumber := int32(len(w.parts)) + 1
+	resp, err := w.driver.S3.UploadPart(context.Background(), &s3.UploadPartInput{
 		Bucket:     aws.String(w.driver.Bucket),
 		Key:        aws.String(w.key),
 		PartNumber: partNumber,
@@ -1532,10 +1582,10 @@ func (w *writer) flushPart() error {
 	if err != nil {
 		return err
 	}
-	w.parts = append(w.parts, &s3.Part{
+	w.parts = append(w.parts, s3types.Part{
 		ETag:       resp.ETag,
 		PartNumber: partNumber,
-		Size:       aws.Int64(int64(len(w.readyPart))),
+		Size:       int64(len(w.readyPart)),
 	})
 	w.readyPart = w.pendingPart
 	w.pendingPart = nil
