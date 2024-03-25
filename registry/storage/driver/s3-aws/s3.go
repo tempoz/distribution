@@ -77,7 +77,7 @@ const noStorageClass = "NONE"
 
 // s3StorageClasses lists all compatible (instant retrieval) S3 storage classes
 var s3StorageClasses = []s3types.StorageClass{
-	s3types.StorageClassStandard,
+	noStorageClass,
 	s3types.StorageClassStandard,
 	s3types.StorageClassReducedRedundancy,
 	s3types.StorageClassStandardIa,
@@ -593,7 +593,6 @@ func New(params DriverParameters) (*Driver, error) {
 			if !params.V4Auth {
 				o.APIOptions = append(o.APIOptions, setv2Handlers)
 			}
-			// o.APIOptions = append(o.APIOptions, s3.)
 		},
 	)
 	if err != nil {
