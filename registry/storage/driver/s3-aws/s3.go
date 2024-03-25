@@ -495,7 +495,7 @@ func getParameterAsInt64(parameters map[string]interface{}, name string, default
 	return rv, nil
 }
 
-// getParameterAsInt32 converts parameters[name] to an int64 value (using
+// getParameterAsInt32 converts parameters[name] to an int32 value (using
 // defaultt if nil), verifies it is no smaller than min, and returns it.
 func getParameterAsInt32(parameters map[string]interface{}, name string, defaultt int32, min int32, max int32) (int32, error) {
 	rv := defaultt
